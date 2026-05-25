@@ -41,6 +41,10 @@ export default function AudioStudio() {
   // once at mount) can always reach the current value.
   const timelineIdRef = useRef(null)
   useEffect(() => { timelineIdRef.current = timelineId }, [timelineId])
+  // Set by handleAddToTimeline when the user adds a currently-previewing track
+  // to the timeline. The load effect reads this flag once the new buffer is
+  // ready and performs a gapless preview→player handoff.
+  const pendingTransferRef = useRef(false)
 
   const timelineTrack = useMemo(
     () => tracks.find((t) => t.id === timelineId) ?? null,
@@ -107,10 +111,35 @@ export default function AudioStudio() {
       try {
         await player.load(timelineTrack.wavBytes)
         if (cancelled) return
-        setCurrentTime(0)
         setDuration(player.getDuration())
         setSpeed(1)
         setVolume(1)
+
+        // Gapless preview→timeline handoff. The preview HTMLAudioElement is
+        // still sounding through the decode window above; sample its position
+        // as late as possible, start the player at that offset, then pause
+        // the preview AFTER play() returns so the two engines briefly overlap
+        // instead of leaving an audible gap.
+        if (pendingTransferRef.current) {
+          pendingTransferRef.current = false
+          const preview = previewAudioRef.current
+          const transferTime = preview ? preview.currentTime : 0
+          try {
+            player.seek(transferTime)
+            await player.play()
+            if (preview && !preview.paused) {
+              preview.pause()
+              preview.currentTime = 0
+            }
+            setPlayingId(timelineTrack.id)
+          } catch (e) {
+            console.error('failed to transfer playback to timeline', e)
+            if (preview) preview.pause()
+            setPlayingId(null)
+          }
+        } else {
+          setCurrentTime(0)
+        }
       } catch (e) {
         console.error('failed to load timeline buffer', e)
       }
@@ -189,43 +218,44 @@ export default function AudioStudio() {
   )
 
   const handleAddToTimeline = useCallback(
-    (id) => {
+    async (id) => {
       const preview = previewAudioRef.current
       const wasPreviewingThis = playingId === id && preview && !preview.paused
-      const transferTime = wasPreviewingThis ? preview.currentTime : 0
 
-      if (preview && !preview.paused) {
-        preview.pause()
-        preview.currentTime = 0
+      // Fast path: the track is already the timeline buffer. No load needed —
+      // sync the player to the preview's position and start it inline.
+      if (id === timelineId && wasPreviewingThis) {
+        const player = playerRef.current
+        if (!player) return
+        try {
+          player.seek(preview.currentTime)
+          await player.play()
+          preview.pause()
+          preview.currentTime = 0
+          setPlayingId(id)
+        } catch (e) {
+          console.error('inline preview→timeline transfer failed', e)
+        }
+        return
       }
-      setPlayingId(null)
-      setTimelineId(id)
 
       if (wasPreviewingThis) {
-        // The timeline-load effect runs async after timelineId changes —
-        // poll for the buffer to be ready, then resume at the transfer point.
-        const start = performance.now()
-        const tryStart = async () => {
-          const player = playerRef.current
-          if (!player) return
-          if (player.getDuration() > 0) {
-            try {
-              player.seek(transferTime)
-              await player.play()
-              setPlayingId(id)
-            } catch (e) {
-              console.error('failed to transfer playback to timeline', e)
-            }
-            return
-          }
-          if (performance.now() - start < 2000) {
-            requestAnimationFrame(tryStart)
-          }
+        // Queue a gapless handoff — the load effect runs after timelineId
+        // changes, and will perform the seek+play+preview-pause sequence
+        // once the new buffer is decoded. Preview keeps sounding until then.
+        pendingTransferRef.current = true
+      } else {
+        // Not playing this track — pause any unrelated preview and do a
+        // standard cold swap.
+        if (preview && !preview.paused) {
+          preview.pause()
+          preview.currentTime = 0
         }
-        requestAnimationFrame(tryStart)
+        setPlayingId(null)
       }
+      setTimelineId(id)
     },
-    [playingId],
+    [playingId, timelineId],
   )
 
   // ── Library mutations ──────────────────────────────────────────────────

@@ -167,7 +167,9 @@ export default function AudioRow({
           }}
           aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
         >
-          <HeartIcon size={20} color="#cc3636" />
+          {/* White when not yet favorited so the action reads as "add"; red
+              once the track is already a favorite so it reads as "remove". */}
+          <HeartIcon size={20} color={isFavorite ? '#cc3636' : '#fff'} />
         </motion.button>
 
         {/* Delete pill */}
