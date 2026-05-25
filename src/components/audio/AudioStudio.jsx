@@ -9,42 +9,59 @@ import {
   getAudioContext,
 } from '../../lib/audioUtils'
 import { putTrack, deleteTrack as dbDeleteTrack, loadAllTracks } from '../../lib/audioStorage'
+import { createTimelinePlayer } from '../../lib/timelinePlayer'
 
 // Top-level audio studio component.
 //
-// Audio playback uses TWO HTMLAudioElements:
-//   • timelineAudioRef → plays the track that was added to the Timeline via the + button.
-//     Its currentTime drives the playhead and the "00:00 / 00:48" readout. Speed slider
-//     drives playbackRate (with pitch coupled). Volume slider drives a Web Audio
-//     GainNode so it can exceed 100% (HTMLAudioElement.volume caps at 1.0).
-//   • previewAudioRef → plays row-level previews. Pressing the play button on a row
-//     starts/stops a preview WITHOUT changing what's on the Timeline. Always 1.0x / 1.0 gain.
-//
-// Web Audio routing (timeline only):
-//   timelineAudio ──▶ MediaElementSource ──▶ GainNode ──▶ destination
-// The graph is built lazily on first play (browsers require a user gesture to
-// resume a suspended AudioContext).
+// Audio playback uses TWO engines:
+//   • Timeline → Web Audio (AudioBufferSourceNode via createTimelinePlayer).
+//     Why: iOS Safari ignores HTMLAudioElement.preservesPitch=false, so we
+//     could only speed-shift on iPhone, never pitch-shift. AudioBufferSource's
+//     playbackRate ALWAYS couples pitch — works the same on every browser.
+//     Volume goes through the player's internal GainNode (0–10x).
+//   • previewAudioRef (HTMLAudioElement) → row-level previews. Always 1.0x,
+//     1.0 gain. Kept on the simpler element because previews don't need
+//     pitch coupling and we get free pause/resume/ended events.
 export default function AudioStudio() {
   const [tracks, setTracks] = useState([])
   const [hydrated, setHydrated] = useState(false)
   const [timelineId, setTimelineId] = useState(null)
-  const [playingId, setPlayingId] = useState(null) // id of whichever audio element is currently playing
+  const [playingId, setPlayingId] = useState(null) // id of whichever audio source is currently playing
   const [currentTime, setCurrentTime] = useState(0)
+  const [duration, setDuration] = useState(0)
   const [speed, setSpeed] = useState(1)
   const [volume, setVolume] = useState(1)            // 1.0 = 100%, up to 10 (1000%)
   const [sliderTab, setSliderTab] = useState('speed')
   const [filter, setFilter] = useState('all')        // 'all' | 'favorites'
   const [isExtracting, setIsExtracting] = useState(false)
-  const timelineAudioRef = useRef(null)
-  const previewAudioRef = useRef(null)
-  const gainNodeRef = useRef(null)
-  const audioCtxRef = useRef(null)
-  const rafRef = useRef(null)
+
+  const playerRef = useRef(null)       // TimelinePlayer instance
+  const previewAudioRef = useRef(null) // HTMLAudioElement for previews
+  // Latest timelineId held in a ref so the player's onEnded callback (created
+  // once at mount) can always reach the current value.
+  const timelineIdRef = useRef(null)
+  useEffect(() => { timelineIdRef.current = timelineId }, [timelineId])
 
   const timelineTrack = useMemo(
     () => tracks.find((t) => t.id === timelineId) ?? null,
     [tracks, timelineId],
   )
+
+  // ── Build the player once on mount. onTick is our playhead clock and
+  // onEnded handles natural end-of-track.
+  useEffect(() => {
+    playerRef.current = createTimelinePlayer({
+      onTick: (t) => setCurrentTime(t),
+      onEnded: () => {
+        const id = timelineIdRef.current
+        setPlayingId((cur) => (cur === id ? null : cur))
+      },
+    })
+    return () => {
+      playerRef.current?.destroy()
+      playerRef.current = null
+    }
+  }, [])
 
   // ── Hydrate from IndexedDB on mount.
   useEffect(() => {
@@ -59,119 +76,73 @@ export default function AudioStudio() {
       })
   }, [])
 
-  // ── Web Audio: build the gain graph for the timeline element lazily.
-  // createMediaElementSource can only be called ONCE per element, so we guard
-  // with audioCtxRef and only wire it up the first time it's needed.
-  const ensureGainGraph = useCallback(() => {
-    if (audioCtxRef.current) return
-    const audioEl = timelineAudioRef.current
-    if (!audioEl) return
-    try {
-      const ctx = getAudioContext()
-      const source = ctx.createMediaElementSource(audioEl)
-      const gain = ctx.createGain()
-      gain.gain.value = volume
-      source.connect(gain)
-      gain.connect(ctx.destination)
-      audioCtxRef.current = ctx
-      gainNodeRef.current = gain
-    } catch (e) {
-      // Some browsers throw if the element was already wired into another
-      // graph — fall back to the native audio.volume below.
-      console.warn('failed to build gain graph', e)
-    }
-  }, [volume])
-
-  // ── Speed (playbackRate + pitch coupling) — timeline only.
+  // ── Speed → player (couples pitch on every browser, iOS included).
   useEffect(() => {
-    const a = timelineAudioRef.current
-    if (!a) return
-    a.playbackRate = Math.max(0.0625, speed)
-    a.preservesPitch = false
-    a.mozPreservesPitch = false
-    a.webkitPreservesPitch = false
-    if (speed === 0 && !a.paused) a.pause()
+    playerRef.current?.setRate(Math.max(0.0625, speed))
   }, [speed])
 
-  // ── Volume — drives the GainNode (preferred) or falls back to audio.volume.
+  // ── Volume → player's internal GainNode (0..10).
   useEffect(() => {
-    const g = gainNodeRef.current
-    if (g) {
-      g.gain.value = volume
-      return
-    }
-    // No gain graph yet: best we can do is clamp to [0, 1] on the element.
-    const a = timelineAudioRef.current
-    if (a) a.volume = Math.max(0, Math.min(1, volume))
+    playerRef.current?.setGain(volume)
   }, [volume])
 
-  // ── RAF loop — only updates the displayed currentTime when the *timeline* track is playing.
+  // ── Load a fresh AudioBuffer into the player whenever the timeline track
+  // changes. Reset speed/volume/playhead so the new clip starts clean.
   useEffect(() => {
-    function tick() {
-      const a = timelineAudioRef.current
-      if (a && !a.paused && playingId === timelineId && timelineId != null) {
-        setCurrentTime(a.currentTime)
-      }
-      rafRef.current = requestAnimationFrame(tick)
-    }
-    rafRef.current = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(rafRef.current)
-  }, [playingId, timelineId])
-
-  // ── When the user changes the timeline track, point the <audio> at it, reset
-  // the playhead, and reset speed + volume to their defaults so the new clip
-  // starts clean (per user note 1).
-  useEffect(() => {
-    const a = timelineAudioRef.current
-    if (!a) return
+    const player = playerRef.current
+    if (!player) return
     if (!timelineTrack) {
-      a.removeAttribute('src')
-      a.load()
+      player.pause()
       setCurrentTime(0)
-      if (playingId === timelineId) setPlayingId(null)
+      setDuration(0)
       setSpeed(1)
       setVolume(1)
       return
     }
-    a.src = timelineTrack.url
-    a.load()
-    setCurrentTime(0)
-    setSpeed(1)
-    setVolume(1)
-    if (playingId === timelineId) setPlayingId(null)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    let cancelled = false
+    // Decode the stored WAV bytes — we already paid this decode cost during
+    // extraction, but the result wasn't kept, so we redo it here on demand.
+    // For typical clips this is well under 100ms.
+    ;(async () => {
+      try {
+        await player.load(timelineTrack.wavBytes)
+        if (cancelled) return
+        setCurrentTime(0)
+        setDuration(player.getDuration())
+        setSpeed(1)
+        setVolume(1)
+      } catch (e) {
+        console.error('failed to load timeline buffer', e)
+      }
+    })()
+    return () => { cancelled = true }
   }, [timelineTrack?.id])
 
   // ── Playback handlers ─────────────────────────────────────────────────
 
   const togglePlayTimeline = useCallback(async () => {
-    const a = timelineAudioRef.current
-    if (!a || !timelineTrack) return
+    const player = playerRef.current
+    if (!player || !timelineTrack) return
     if (previewAudioRef.current && !previewAudioRef.current.paused) {
       previewAudioRef.current.pause()
     }
-    if (!a.paused) {
-      a.pause()
+    if (player.isPlaying()) {
+      player.pause()
       setPlayingId((id) => (id === timelineTrack.id ? null : id))
       return
     }
-    // First play of this audio element → wire up the gain graph (needs a user gesture).
-    ensureGainGraph()
-    if (audioCtxRef.current?.state === 'suspended') {
-      try { await audioCtxRef.current.resume() } catch {}
-    }
     try {
-      await a.play()
+      await player.play()
       setPlayingId(timelineTrack.id)
     } catch (e) {
       console.error('timeline play failed', e)
     }
-  }, [timelineTrack, ensureGainGraph])
+  }, [timelineTrack])
 
   const handleSeek = useCallback((sec) => {
-    const a = timelineAudioRef.current
-    if (!a) return
-    a.currentTime = sec
+    const player = playerRef.current
+    if (!player) return
+    player.seek(sec)
     setCurrentTime(sec)
   }, [])
 
@@ -189,8 +160,11 @@ export default function AudioStudio() {
       const preview = previewAudioRef.current
       if (!preview) return
 
-      const timeline = timelineAudioRef.current
-      if (timeline && !timeline.paused) timeline.pause()
+      // Pause the timeline player if it's running — only one thing plays at a time.
+      if (playerRef.current?.isPlaying()) {
+        playerRef.current.pause()
+        setPlayingId((cur) => (cur === timelineId ? null : cur))
+      }
 
       if (playingId === id && !preview.paused) {
         preview.pause()
@@ -228,26 +202,30 @@ export default function AudioStudio() {
       setTimelineId(id)
 
       if (wasPreviewingThis) {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(async () => {
-            const timeline = timelineAudioRef.current
-            if (!timeline) return
+        // The timeline-load effect runs async after timelineId changes —
+        // poll for the buffer to be ready, then resume at the transfer point.
+        const start = performance.now()
+        const tryStart = async () => {
+          const player = playerRef.current
+          if (!player) return
+          if (player.getDuration() > 0) {
             try {
-              ensureGainGraph()
-              if (audioCtxRef.current?.state === 'suspended') {
-                try { await audioCtxRef.current.resume() } catch {}
-              }
-              timeline.currentTime = transferTime
-              await timeline.play()
+              player.seek(transferTime)
+              await player.play()
               setPlayingId(id)
             } catch (e) {
               console.error('failed to transfer playback to timeline', e)
             }
-          })
-        })
+            return
+          }
+          if (performance.now() - start < 2000) {
+            requestAnimationFrame(tryStart)
+          }
+        }
+        requestAnimationFrame(tryStart)
       }
     },
-    [playingId, ensureGainGraph],
+    [playingId],
   )
 
   // ── Library mutations ──────────────────────────────────────────────────
@@ -372,14 +350,16 @@ export default function AudioStudio() {
     [tracks, timelineId, playingId],
   )
 
+  // Derived track passed to <Timeline />. We override its duration with what
+  // the player reports (always identical for now, but keeps the contract clear).
+  const timelineTrackForUi = useMemo(() => {
+    if (!timelineTrack) return null
+    return { ...timelineTrack, duration: duration || timelineTrack.duration }
+  }, [timelineTrack, duration])
+
   return (
     <div className="min-h-screen w-full flex items-start justify-center py-10 px-4 bg-[#0a0b10]">
-      <audio
-        ref={timelineAudioRef}
-        onEnded={() => setPlayingId((id) => (id === timelineId ? null : id))}
-        onPause={() => setPlayingId((id) => (id === timelineId ? null : id))}
-        className="hidden"
-      />
+      {/* Preview-only HTMLAudioElement — timeline now goes through Web Audio. */}
       <audio
         ref={previewAudioRef}
         onEnded={() => setPlayingId((id) => (id !== timelineId ? null : id))}
@@ -389,7 +369,7 @@ export default function AudioStudio() {
 
       <div className="flex flex-col gap-[10px]" style={{ width: 382 }}>
         <Timeline
-          track={timelineTrack}
+          track={timelineTrackForUi}
           currentTime={currentTime}
           isPlaying={playingId === timelineId && timelineId != null}
           onTogglePlay={togglePlayTimeline}
