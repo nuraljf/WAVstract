@@ -121,6 +121,14 @@ export default function AudioRow({
         userSelect: 'none',
         // Clip everything — action pills live off-screen-right until swiped.
         overflow: 'hidden',
+        // Mobile Safari bug: transformed children can bleed past an
+        // `overflow: hidden` parent. `isolation: isolate` + a tiny
+        // border-radius rounding hack force a fresh stacking context
+        // and a real composite layer, which makes the clip work.
+        isolation: 'isolate',
+        borderRadius: 16,
+        WebkitTransform: 'translateZ(0)',
+        transform: 'translateZ(0)',
       }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
