@@ -1,5 +1,5 @@
 import React, { useRef, useEffect } from 'react'
-import { motion, useMotionValue, useTransform, animate } from 'motion/react'
+import { motion, AnimatePresence, useMotionValue, useTransform, animate } from 'motion/react'
 import { PlusIcon, TrashIcon, HeartIcon } from './icons'
 import PlayPauseIcon from './PlayPauseIcon'
 import MiniWaveform from './MiniWaveform'
@@ -10,21 +10,14 @@ import { formatTime } from '../../lib/audioUtils'
 //   • audio (playing)     44:678 — white/10% fill + white/10% stroke (hover)
 //   • audio (edit)        42:520 — swiped: row splits into [audio card | heart | Delete]
 //
-// SMOOTH SWIPE MODEL
-// ──────────────────
-// One motion value drives the swipe: `x`, going from 0 (closed) to -REVEAL (open).
-// Everything that animates during the swipe — card width, action-pill positions,
-// inner card content opacity — is derived from that single `x` via linear
-// `useTransform`s. No element runs on its own non-linear sub-range, so the whole
-// row glides as a single unit no matter how fast the finger moves.
-//
-// Layout invariant at any swipe progress p ∈ [0, 1]:
-//   • Card width:        342 - 175·p   (342 → 167)
-//   • Heart-pill x:      342 - 167·p   (sits 0–8px to the right of the card edge)
-//   • Delete-pill x:     342 - 119·p   (sits right after the heart pill)
-// Because heart-x − card-right = 8·p, the small 0→8px gap at the card edge grows
-// in lockstep with the swipe — no perceptible drift or snap.
-const REVEAL = 175
+// Heart pill (40w) + 8px gap + Delete pill (119w) = 167w action group.
+// Card shrinks from 342 → 175 to make room (175 = 167 + 8 gap to card edge).
+const HEART_W = 40
+const PILL_GAP = 8
+const DELETE_W = 119
+const GROUP_W = HEART_W + PILL_GAP + DELETE_W // 167
+const CARD_GAP = 8                              // gap between card and heart
+const REVEAL = GROUP_W + CARD_GAP               // 175 — total swipe distance
 
 export default function AudioRow({
   track,
@@ -43,13 +36,14 @@ export default function AudioRow({
   })
 
   // ── Linear transforms — all derived from `x` so they update on the same frame.
-  // Card shrinks from full 342 → 167 as we swipe.
-  const cardWidth = useTransform(x, [-REVEAL, 0], [167, 342])
-  // Action pills slide in from off-screen-right. At rest they sit at left=342
-  // (outside the row's overflow:hidden clip). At full reveal they snap to their
-  // Figma positions.
-  const heartX = useTransform(x, [-REVEAL, 0], [175, 342])
-  const deleteX = useTransform(x, [-REVEAL, 0], [223, 342])
+  // Card shrinks from full 342 → 175 as we swipe (175 = action-group + 8px gap).
+  const cardWidth = useTransform(x, [-REVEAL, 0], [342 - REVEAL, 342])
+  // Action group slides in from off-screen-right as a single rigid unit, so
+  // the heart and delete pills NEVER drift or overlap mid-swipe — their
+  // relative geometry is fixed inside the group. At rest the group sits at
+  // left=342 with translateX=0 (fully clipped by the overflow:hidden parent);
+  // at full reveal it translates -GROUP_W to land flush against the card.
+  const groupX = useTransform(x, [-REVEAL, 0], [-GROUP_W, 0])
   // Inside the card, play icon + trailing controls smoothly collapse alongside
   // the card width. Same linear range as the geometry → no separate "snap".
   const playWidth = useTransform(x, [-REVEAL, 0], [0, 34])
@@ -69,7 +63,15 @@ export default function AudioRow({
 
   function snap(open) {
     dragState.current.revealed = open
-    animate(x, open ? -REVEAL : 0, { type: 'spring', stiffness: 420, damping: 38 })
+    // Slight bounce on open (mass>1, lower damping) reads as iOS-style spring;
+    // close is crisper so dismissing feels instant.
+    animate(
+      x,
+      open ? -REVEAL : 0,
+      open
+        ? { type: 'spring', stiffness: 380, damping: 30, mass: 0.9 }
+        : { type: 'spring', stiffness: 500, damping: 40 },
+    )
   }
 
   function onPointerDown(e) {
@@ -135,52 +137,64 @@ export default function AudioRow({
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
-      {/* Heart (favorite) pill — slides in from the right */}
-      <motion.button
-        onClick={(e) => {
-          e.stopPropagation()
-          onToggleFavorite?.()
-          snap(false)
-        }}
-        className="absolute top-1/2 flex items-center justify-center transition active:scale-95"
-        style={{
-          x: heartX,
-          y: '-50%',
-          left: 0,
-          width: 40,
-          height: 40,
-          borderRadius: 99,
-          background: 'rgba(255,255,255,0.10)',
-          border: '1px solid rgba(255,255,255,0.10)',
-        }}
-        aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+      {/* Action group — heart + delete as one rigid unit. Anchored just past
+          the right edge (left=342) and translated in via groupX. Because
+          spacing inside the group is fixed pixels, the two pills can never
+          overlap or drift, no matter how fast/slow the swipe. */}
+      <motion.div
+        className="absolute top-0"
+        style={{ left: 342, width: GROUP_W, height: 55, x: groupX }}
       >
-        <HeartIcon size={20} color="#cc3636" />
-      </motion.button>
+        {/* Heart (favorite) pill */}
+        <motion.button
+          onClick={(e) => {
+            e.stopPropagation()
+            onToggleFavorite?.()
+            snap(false)
+          }}
+          whileTap={{ scale: 0.88 }}
+          transition={{ type: 'spring', stiffness: 600, damping: 22 }}
+          className="absolute flex items-center justify-center"
+          style={{
+            left: 0,
+            top: '50%',
+            y: '-50%',
+            width: HEART_W,
+            height: HEART_W,
+            borderRadius: 99,
+            background: 'rgba(255,255,255,0.10)',
+            border: '1px solid rgba(255,255,255,0.10)',
+          }}
+          aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+        >
+          <HeartIcon size={20} color="#cc3636" />
+        </motion.button>
 
-      {/* Delete pill — slides in right after the heart */}
-      <motion.button
-        onClick={(e) => {
-          e.stopPropagation()
-          onDelete?.()
-          snap(false)
-        }}
-        className="absolute top-0 flex items-center justify-center transition active:scale-[0.98]"
-        style={{
-          x: deleteX,
-          left: 0,
-          width: 119,
-          height: 55,
-          borderRadius: 16,
-          background: 'rgba(255,67,67,0.80)',
-          border: '1px solid rgba(255,255,255,0.10)',
-          gap: 6,
-        }}
-        aria-label="Delete"
-      >
-        <TrashIcon size={20} color="#fff" />
-        <span className="font-sf text-white text-[16px] leading-[19px]">Delete</span>
-      </motion.button>
+        {/* Delete pill */}
+        <motion.button
+          onClick={(e) => {
+            e.stopPropagation()
+            onDelete?.()
+            snap(false)
+          }}
+          whileTap={{ scale: 0.96 }}
+          transition={{ type: 'spring', stiffness: 600, damping: 24 }}
+          className="absolute top-0 flex items-center justify-center"
+          style={{
+            left: HEART_W + PILL_GAP,
+            width: DELETE_W,
+            height: 55,
+            borderRadius: 16,
+            background: 'rgba(255,67,67,0.80)',
+            border: '1px solid rgba(255,255,255,0.10)',
+            gap: 6,
+          }}
+          aria-label="Delete"
+        >
+          <TrashIcon size={20} color="#fff" />
+          <span className="font-sf text-white text-[16px] leading-[19px]">Delete</span>
+        </motion.button>
+      </motion.div>
 
       {/* Audio card — width shrinks on swipe; bg/border adopt 'playing' style on hover/active/swipe */}
       <motion.div
@@ -214,19 +228,40 @@ export default function AudioRow({
             </div>
           </motion.button>
 
-          {/* When favorited, swap the second slot from waveform-icon to a red heart
-              so the row visually flags it as a favorite (matches Figma 64:71). */}
-          <div className="flex items-center justify-center shrink-0" style={{ width: 24, height: 24 }}>
-            {isFavorite ? (
-              <HeartIcon size={20} color="#cc3636" />
-            ) : (
-              <MiniWaveform
-                peaks={track.peaks}
-                width={24}
-                height={24}
-                color={isPlaying ? '#fff' : 'rgba(255,255,255,0.85)'}
-              />
-            )}
+          {/* Second slot — morphs between waveform and red heart with a scale
+              spring when the favorite state flips, so tapping the heart action
+              produces a fluid pop-in instead of an abrupt asset swap. */}
+          <div className="relative shrink-0" style={{ width: 24, height: 24 }}>
+            <AnimatePresence mode="popLayout" initial={false}>
+              {isFavorite ? (
+                <motion.div
+                  key="fav"
+                  initial={{ scale: 0.3, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.3, opacity: 0 }}
+                  transition={{ type: 'spring', stiffness: 520, damping: 18 }}
+                  className="absolute inset-0 flex items-center justify-center"
+                >
+                  <HeartIcon size={20} color="#cc3636" />
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="wave"
+                  initial={{ scale: 0.6, opacity: 0 }}
+                  animate={{ scale: 1, opacity: 1 }}
+                  exit={{ scale: 0.6, opacity: 0 }}
+                  transition={{ type: 'spring', stiffness: 520, damping: 24 }}
+                  className="absolute inset-0 flex items-center justify-center"
+                >
+                  <MiniWaveform
+                    peaks={track.peaks}
+                    width={24}
+                    height={24}
+                    color={isPlaying ? '#fff' : 'rgba(255,255,255,0.85)'}
+                  />
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
           {/* Track name */}
