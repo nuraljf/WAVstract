@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro", "SF Pro Display",
+      "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: #0a0b10;
+    color: #ffffff;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@layer utilities {
+  .font-sf {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro", "SF Pro Display",
+      "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  .font-sf-semibold {
+    font-weight: 590;
+  }
+}
