@@ -1,0 +1,11 @@
+# Railway build config (nixpacks)
+# Installs yt-dlp + ffmpeg so the /api/extract-link endpoint works in production.
+
+[phases.setup]
+nixPkgs = ['yt-dlp', 'ffmpeg']
+
+[phases.build]
+cmds = ['npm ci', 'npm run build']
+
+[start]
+cmd = 'node server.js'
