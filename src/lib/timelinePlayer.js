@@ -36,6 +36,52 @@ function getCtx() {
   return getCtx._ctx
 }
 
+// ── iOS audio-session unlock ─────────────────────────────────────────────
+// On iPhone, Web Audio defaults to the "ambient" audio session, which is
+// silenced by the ringer/silent switch and sometimes by iOS power management.
+// HTMLAudioElement plays through "playback" which is audible regardless.
+// Trick: keep a tiny silent HTMLAudioElement looping from the first user
+// gesture onward — iOS elevates the whole page (Web Audio included) to the
+// playback session, and our AudioBufferSourceNodes become audible.
+let _unlockEl = null
+let _unlockTried = false
+function buildSilentWavUrl() {
+  // 0.05s mono 16-bit PCM of pure silence.
+  const sampleRate = 22050
+  const samples = Math.floor(sampleRate * 0.05)
+  const dataLen = samples * 2
+  const buf = new ArrayBuffer(44 + dataLen)
+  const view = new DataView(buf)
+  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)) }
+  writeStr(0, 'RIFF'); view.setUint32(4, 36 + dataLen, true); writeStr(8, 'WAVE')
+  writeStr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true); view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true)
+  writeStr(36, 'data'); view.setUint32(40, dataLen, true)
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }))
+}
+async function unlockIOSAudio() {
+  if (_unlockTried) return
+  _unlockTried = true
+  try {
+    const el = document.createElement('audio')
+    el.src = buildSilentWavUrl()
+    el.loop = true
+    el.playsInline = true
+    el.setAttribute('playsinline', '')
+    el.setAttribute('webkit-playsinline', '')
+    el.preload = 'auto'
+    el.style.display = 'none'
+    document.body.appendChild(el)
+    await el.play()
+    _unlockEl = el
+  } catch (e) {
+    // Silent unlock failed — likely the user gesture was lost. Not fatal;
+    // audio may still work if the silent switch is off.
+    console.warn('iOS audio unlock failed', e)
+  }
+}
+
 export function createTimelinePlayer({ onEnded, onTick } = {}) {
   const ctx = getCtx()
   const gain = ctx.createGain()
@@ -95,6 +141,10 @@ export function createTimelinePlayer({ onEnded, onTick } = {}) {
 
   async function play() {
     if (!buffer || playing) return
+    // iOS: elevate to the playback audio session BEFORE resuming the context,
+    // and do it without await so we don't lose the user-gesture window that
+    // iOS requires for both unlock and ctx.resume().
+    unlockIOSAudio()
     // Browsers suspend the context until a user gesture — resume here.
     if (ctx.state === 'suspended') {
       try { await ctx.resume() } catch {}

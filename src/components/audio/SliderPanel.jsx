@@ -17,11 +17,29 @@ import { motion } from 'motion/react'
 // Both sliders reuse the same 22-px-tall track + 16-px white thumb so the
 // active control looks consistent when you flip tabs.
 
+// Slider geometry — see Figma node 44:753 / 58:121.
+//
+//   ┌──────────────────────────────────────────────────────┐  ← track (22)
+//   │   ┌──────────────────────────────────────┐           │
+//   │   │ fill bar (16, blue)            ╭──╮  │           │   ← FILL_INSET (3)
+//   │   │                                │◉ │  │           │   ← thumb (16 outer
+//   │   └──────────────────────────────────────┘           │     blue, 12 inner
+//   │                                                      │     white)
+//   └──────────────────────────────────────────────────────┘
+//
+// The fill bar and the thumb are both inset 3px from the track top/bottom
+// (FILL_INSET) and share the same height (FILL_HEIGHT), so the fill flows
+// seamlessly INTO the blue ring of the thumb. The white inner circle sits
+// inside the blue thumb with INNER_INSET (2px) of padding, giving the always-
+// visible blue halo around the white dot per Figma.
 const TRACK_WIDTH = 342
 const TRACK_HEIGHT = 22
-const THUMB_SIZE = 16
-const THUMB_INSET = (TRACK_HEIGHT - THUMB_SIZE) / 2
-const TRAVEL = TRACK_WIDTH - THUMB_SIZE
+const FILL_HEIGHT = 16
+const FILL_INSET = (TRACK_HEIGHT - FILL_HEIGHT) / 2   // 3
+const THUMB_OUTER = FILL_HEIGHT                       // 16 — merges with fill bar
+const THUMB_INNER = 12                                // white circle inside
+const INNER_INSET = (THUMB_OUTER - THUMB_INNER) / 2   // 2
+const TRAVEL = TRACK_WIDTH - THUMB_OUTER
 
 const SPEED_TICK_VALUES = [0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
 const SPEED_TICK_LABELS = ['0x', '0.2x', '0.4x', '0.6x', '0.8x', '1.0x', '1.2x', '1.4x', '1.6x', '1.8x', '2.0x']
@@ -117,14 +135,14 @@ function SpeedTab({ value, onChange }) {
   const thumbX = ((clamped - MIN) / (MAX - MIN)) * TRAVEL
   const trackCenter = TRACK_WIDTH / 2
   const fillLeft = Math.min(trackCenter, thumbX)
-  const fillRight = Math.max(trackCenter, thumbX + THUMB_SIZE)
+  const fillRight = Math.max(trackCenter, thumbX + THUMB_OUTER)
   const fillWidth = Math.max(0, fillRight - fillLeft)
 
   const seekFromClientX = useCallback(
     (clientX) => {
       if (!trackRef.current) return
       const rect = trackRef.current.getBoundingClientRect()
-      const px = Math.max(0, Math.min(TRAVEL, clientX - rect.left - THUMB_SIZE / 2))
+      const px = Math.max(0, Math.min(TRAVEL, clientX - rect.left - THUMB_OUTER / 2))
       const raw = MIN + (px / TRAVEL) * (MAX - MIN)
       onChange(Math.round(raw / STEP) * STEP)
     },
@@ -157,35 +175,43 @@ function SpeedTab({ value, onChange }) {
       <div
         ref={trackRef}
         onClick={handleTrackClick}
-        className="absolute cursor-pointer overflow-hidden"
+        className="absolute cursor-pointer"
         style={{
           left: 20, top: 68, width: TRACK_WIDTH, height: TRACK_HEIGHT,
           borderRadius: 99, background: 'rgba(255,255,255,0.10)', touchAction: 'none',
         }}
       >
-        {fillWidth < 1 && (
-          <div
-            className="absolute top-1/2 -translate-y-1/2"
-            style={{ left: trackCenter - 0.5, width: 1, height: 8, background: 'rgba(255,255,255,0.45)', borderRadius: 1 }}
-          />
-        )}
+        {/* Blue fill bar — inset 3px top/bottom so the track shows above/below it. */}
         <div
-          className="absolute top-0 h-full"
+          className="absolute"
           style={{
-            left: fillLeft, width: fillWidth, background: '#1a62ff', borderRadius: 99,
+            left: fillLeft, top: FILL_INSET, width: fillWidth, height: FILL_HEIGHT,
+            background: '#1a62ff', borderRadius: 99,
             transition: dragging ? 'none' : 'left 0.12s ease, width 0.12s ease',
           }}
         />
+        {/* Compound thumb — blue outer circle (matches fill height) + white inner.
+            The blue outer merges with the fill bar; the white inner sits 2px
+            inside, leaving the visible blue halo per Figma even at 1.0x. */}
         <div
           onPointerDown={handlePointerDown}
           className="absolute"
           style={{
-            left: thumbX, top: THUMB_INSET, width: THUMB_SIZE, height: THUMB_SIZE,
+            left: thumbX, top: FILL_INSET, width: THUMB_OUTER, height: THUMB_OUTER,
+            borderRadius: '50%', background: '#1a62ff',
             cursor: dragging ? 'grabbing' : 'grab',
             transition: dragging ? 'none' : 'left 0.12s ease',
           }}
         >
-          <div className="w-full h-full bg-white" style={{ borderRadius: 99, boxShadow: '0 1px 3px rgba(0,0,0,0.45)' }} />
+          <div
+            className="absolute"
+            style={{
+              left: INNER_INSET, top: INNER_INSET,
+              width: THUMB_INNER, height: THUMB_INNER,
+              borderRadius: '50%', background: '#fff',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.45)',
+            }}
+          />
         </div>
       </div>
 
@@ -240,13 +266,13 @@ function VolumeTab({ value, onChange }) {
 
   const thumbX = positionFromValue(clamped) * TRAVEL
   // Fill wraps from the LEFT edge of the track around the thumb.
-  const fillWidth = thumbX + THUMB_SIZE
+  const fillWidth = thumbX + THUMB_OUTER
 
   const seekFromClientX = useCallback(
     (clientX) => {
       if (!trackRef.current) return
       const rect = trackRef.current.getBoundingClientRect()
-      const px = Math.max(0, Math.min(TRAVEL, clientX - rect.left - THUMB_SIZE / 2))
+      const px = Math.max(0, Math.min(TRAVEL, clientX - rect.left - THUMB_OUTER / 2))
       const raw = valueFromPosition(px / TRAVEL)
       // Snap to 5% increments so the percent readout settles at clean numbers.
       onChange(Math.round(raw / PERCENT_STEP) * PERCENT_STEP)
@@ -280,29 +306,41 @@ function VolumeTab({ value, onChange }) {
       <div
         ref={trackRef}
         onClick={handleTrackClick}
-        className="absolute cursor-pointer overflow-hidden"
+        className="absolute cursor-pointer"
         style={{
           left: 20, top: 68, width: TRACK_WIDTH, height: TRACK_HEIGHT,
           borderRadius: 99, background: 'rgba(255,255,255,0.10)', touchAction: 'none',
         }}
       >
+        {/* Blue fill — same geometry rules as SpeedTab. */}
         <div
-          className="absolute top-0 h-full"
+          className="absolute"
           style={{
-            left: 0, width: fillWidth, background: '#1a62ff', borderRadius: 99,
+            left: 0, top: FILL_INSET, width: fillWidth, height: FILL_HEIGHT,
+            background: '#1a62ff', borderRadius: 99,
             transition: dragging ? 'none' : 'width 0.12s ease',
           }}
         />
+        {/* Compound thumb — see SpeedTab for the why. */}
         <div
           onPointerDown={handlePointerDown}
           className="absolute"
           style={{
-            left: thumbX, top: THUMB_INSET, width: THUMB_SIZE, height: THUMB_SIZE,
+            left: thumbX, top: FILL_INSET, width: THUMB_OUTER, height: THUMB_OUTER,
+            borderRadius: '50%', background: '#1a62ff',
             cursor: dragging ? 'grabbing' : 'grab',
             transition: dragging ? 'none' : 'left 0.12s ease',
           }}
         >
-          <div className="w-full h-full bg-white" style={{ borderRadius: 99, boxShadow: '0 1px 3px rgba(0,0,0,0.45)' }} />
+          <div
+            className="absolute"
+            style={{
+              left: INNER_INSET, top: INNER_INSET,
+              width: THUMB_INNER, height: THUMB_INNER,
+              borderRadius: '50%', background: '#fff',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.45)',
+            }}
+          />
         </div>
       </div>
 
@@ -316,7 +354,7 @@ function VolumeTab({ value, onChange }) {
           const p = positionFromValue(v)
           // Center the label under its anchor x. Pull edges in so 0% and 1000%
           // align with the slider's ends rather than overflowing.
-          const x = p * TRAVEL + THUMB_SIZE / 2
+          const x = p * TRAVEL + THUMB_OUTER / 2
           return (
             <span
               key={v}
