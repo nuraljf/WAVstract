@@ -10,50 +10,21 @@ import { Readable } from 'node:stream'
 // Lets the "Extract from link" input handle pages like TikTok / YouTube /
 // Instagram by doing the work outside the browser.
 //
-// Resolution order:
-//   1. yt-dlp (-g): grab the direct media URL from the page. Supports almost
-//      every video site. Requires `yt-dlp` on the user's PATH.
-//   2. tikwm.com fallback: if yt-dlp isn't installed or errors out AND the
-//      URL is TikTok, ask the free tikwm public API for a direct mp4 URL.
+// Strategy:
+//   1. yt-dlp streaming: spawn yt-dlp with `-o -` so it downloads the audio
+//      and writes it to stdout. We pipe stdout straight into the HTTP
+//      response. Crucially, yt-dlp manages the HTTP headers it needs to
+//      talk to the source CDN itself — there's no second fetch from our
+//      side that could 403 because of a UA / client / IP mismatch.
+//   2. tikwm fallback (TikTok only): if yt-dlp isn't installed or fails
+//      before emitting any bytes, the free tikwm API returns a direct mp4
+//      URL we can fetch normally.
 //
-// Then fetch the resolved media URL with a sane Referer (TikTok CDNs require
-// it) and stream the bytes back to the browser, which decodes them via
+// The response bytes go to the browser, which decodes them via
 // AudioContext.decodeAudioData like any other source.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ytDlpResolve(url) {
-  // `yt-dlp -g` prints one or more direct media URLs (audio + video on
-  // separate lines for some sites). We take the first one — for "bestaudio"
-  // format selection that's already the audio-only stream when available.
-  return new Promise((resolve, reject) => {
-    let proc
-    try {
-      proc = spawn('yt-dlp', ['-g', '-f', 'bestaudio/best', '--no-playlist', url], {
-        windowsHide: true,
-      })
-    } catch (e) {
-      reject(e)
-      return
-    }
-    let stdout = ''
-    let stderr = ''
-    proc.stdout.on('data', (d) => { stdout += d.toString() })
-    proc.stderr.on('data', (d) => { stderr += d.toString() })
-    proc.on('error', (err) => {
-      // ENOENT = yt-dlp not installed → caller should fall back.
-      reject(err)
-    })
-    proc.on('close', (code) => {
-      if (code === 0) {
-        const first = stdout.trim().split('\n').filter(Boolean)[0]
-        if (first) resolve(first)
-        else reject(new Error('yt-dlp returned no URL'))
-      } else {
-        reject(new Error(stderr.trim().split('\n').slice(-1)[0] || `yt-dlp exited ${code}`))
-      }
-    })
-  })
-}
+function isTikTok(url) { return /tiktok\.com/i.test(url) }
 
 async function tikwmResolve(url) {
   const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`
@@ -66,7 +37,26 @@ async function tikwmResolve(url) {
   return media
 }
 
-function isTikTok(url) { return /tiktok\.com/i.test(url) }
+// Stream the resolved tikwm mp4 back to the browser. Used only when yt-dlp
+// has already failed and the URL is TikTok.
+async function pipeTikwm(target, res) {
+  const mediaUrl = await tikwmResolve(target)
+  const mediaRes = await fetch(mediaUrl, {
+    headers: {
+      Referer: 'https://www.tiktok.com/',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    },
+  })
+  if (!mediaRes.ok || !mediaRes.body) {
+    throw new Error(`tikwm media fetch HTTP ${mediaRes.status}`)
+  }
+  res.statusCode = 200
+  res.setHeader('Content-Type', mediaRes.headers.get('content-type') || 'video/mp4')
+  const len = mediaRes.headers.get('content-length')
+  if (len) res.setHeader('Content-Length', len)
+  Readable.fromWeb(mediaRes.body).pipe(res)
+}
 
 function extractLinkPlugin() {
   return {
@@ -82,78 +72,101 @@ function extractLinkPlugin() {
           return
         }
 
-        const tried = []
-        let mediaUrl = null
-        let lastErr = null
+        // Prefer m4a/aac (Safari + iOS decode natively) then fall back to
+        // whatever bestaudio yields. `-o -` writes the audio bytes to stdout
+        // and `--no-warnings` keeps stderr quiet on success.
+        const args = [
+          '-f', 'bestaudio[ext=m4a]/bestaudio/best',
+          '--no-playlist',
+          '--no-warnings',
+          '--no-progress',
+          '-o', '-',
+          target,
+        ]
 
-        // 1) yt-dlp
+        let proc
         try {
-          mediaUrl = await ytDlpResolve(target)
-          tried.push('yt-dlp ✓')
+          proc = spawn('yt-dlp', args, { windowsHide: true })
         } catch (err) {
-          tried.push(`yt-dlp ✗ (${err?.code === 'ENOENT' ? 'not installed' : err?.message || 'failed'})`)
-          lastErr = err
-        }
-
-        // 2) tikwm fallback (TikTok only)
-        if (!mediaUrl && isTikTok(target)) {
-          try {
-            mediaUrl = await tikwmResolve(target)
-            tried.push('tikwm ✓')
-          } catch (err) {
-            tried.push(`tikwm ✗ (${err?.message || 'failed'})`)
-            lastErr = err
-          }
-        }
-
-        if (!mediaUrl) {
-          res.statusCode = 502
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({
-            error: 'Could not resolve media URL.',
-            tried,
-            hint: lastErr?.code === 'ENOENT'
-              ? 'Install yt-dlp (pip install yt-dlp) for full site support.'
-              : undefined,
-          }))
+          // Synchronous spawn failure — fall back if TikTok, else 502.
+          await respondFallback(target, res, err, 'yt-dlp spawn failed')
           return
         }
 
-        // 3) Fetch the resolved media URL and stream it back to the browser.
-        try {
-          const mediaRes = await fetch(mediaUrl, {
-            headers: {
-              // TikTok CDN requires a same-site referer to avoid 403.
-              Referer: isTikTok(target) ? 'https://www.tiktok.com/' : '',
-              'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-            },
-          })
-          if (!mediaRes.ok || !mediaRes.body) {
-            res.statusCode = 502
-            res.setHeader('Content-Type', 'application/json')
-            res.end(JSON.stringify({
-              error: `Media fetch failed: HTTP ${mediaRes.status}`,
-              resolvedFrom: tried,
-            }))
-            return
-          }
+        let headersSent = false
+        let stderrBuf = ''
+
+        // First chunk on stdout means yt-dlp succeeded — flip to a 200 and
+        // start streaming. Until then we hold the response so we can still
+        // respond with a JSON error on failure.
+        proc.stdout.once('data', (chunk) => {
+          headersSent = true
           res.statusCode = 200
           res.setHeader(
             'Content-Type',
-            mediaRes.headers.get('content-type') || 'audio/mpeg',
+            // The container is whatever yt-dlp downloaded; the browser sniffs
+            // by bytes so this header is mostly informational. mp4 covers
+            // m4a and bare mp4 audio tracks.
+            'audio/mp4',
           )
-          const len = mediaRes.headers.get('content-length')
-          if (len) res.setHeader('Content-Length', len)
-          Readable.fromWeb(mediaRes.body).pipe(res)
-        } catch (err) {
-          res.statusCode = 502
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: err?.message || 'fetch failed' }))
-        }
+          res.write(chunk)
+          proc.stdout.pipe(res)
+        })
+
+        proc.stderr.on('data', (d) => { stderrBuf += d.toString() })
+
+        proc.on('error', async (err) => {
+          // ENOENT = not installed; ECHILD etc. = killed.
+          if (headersSent) {
+            // Already streaming — best we can do is close the response.
+            try { res.end() } catch {}
+            return
+          }
+          await respondFallback(target, res, err, err?.code === 'ENOENT'
+            ? 'yt-dlp not installed'
+            : err?.message || 'yt-dlp error')
+        })
+
+        proc.on('close', async (code) => {
+          if (headersSent) {
+            // Bytes already flowing — let the pipe finish naturally.
+            return
+          }
+          const lastLine = stderrBuf.trim().split('\n').slice(-1)[0] || `yt-dlp exited ${code}`
+          await respondFallback(target, res, new Error(lastLine), lastLine)
+        })
       })
     },
   }
+}
+
+// Try tikwm if the source is TikTok; otherwise return a 502 with diagnostic.
+async function respondFallback(target, res, originalErr, reason) {
+  if (res.headersSent || res.writableEnded) return
+  if (isTikTok(target)) {
+    try {
+      await pipeTikwm(target, res)
+      return
+    } catch (e) {
+      if (res.headersSent || res.writableEnded) return
+      res.statusCode = 502
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({
+        error: `tikwm fallback failed: ${e?.message || e}`,
+        ytDlp: reason,
+      }))
+      return
+    }
+  }
+  res.statusCode = 502
+  res.setHeader('Content-Type', 'application/json')
+  res.end(JSON.stringify({
+    error: 'Could not extract audio.',
+    ytDlp: reason,
+    hint: originalErr?.code === 'ENOENT'
+      ? 'Install yt-dlp (winget install yt-dlp.yt-dlp) and restart the dev server.'
+      : undefined,
+  }))
 }
 
 export default defineConfig({
